@@ -6,6 +6,22 @@ Designed for https://github.com/Uotan-Dev/uotan_riscv_emu
 
 This plan outlines a dynamic translation (JIT) system for `uemu` to enhance performance by translating "hot" RISC-V guest code into host machine code. It incorporates an asynchronous compilation model with robust handling for interrupts, memory management, and self-modifying code (SMC).
 
+### License
+Copyright 2025 Nuo Shen, Nanjing University  
+Copyright 2025 UOTAN  
+
+Licensed under the Apache License, Version 2.0 (the "License");  
+you may not use this file except in compliance with the License.  
+You may obtain a copy of the License at  
+
+    http://www.apache.org/licenses/LICENSE-2.0  
+
+Unless required by applicable law or agreed to in writing, software  
+distributed under the License is distributed on an "AS IS" BASIS,  
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  
+See the License for the specific language governing permissions and  
+limitations under the License.
+
 ### I. Core Translator & Execution Model
 
 The foundation is a Basic Block (BB) interpreter that identifies hot code, dispatches to a separate compilation thread, and executes translated code.
