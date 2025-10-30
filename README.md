@@ -42,6 +42,7 @@ This section details the cache and the critical mechanism for handling self-modi
     * Perform the write to guest RAM.
     * **Increment the page version:** `page_versions[PFN(PA)]++`.
     * **Invalidate:** Use the reverse-map to find and remove all JIT blocks that originate from this `PFN`.
+    * **Reset hotness counters:** Set all hotness counters for invalidated blocks to 0.
     * Release the `tcg_cache_lock`.
 5.  **Reverse Mapping:** A `PFN -> [list of JIT blocks]` table is required for efficient invalidation (as described in II.4).
 
@@ -73,3 +74,113 @@ This model prevents compilation from stalling the CPU.
             * **Verification 2:** Check if another thread compiled this block in the meantime (`tcg_cache.lookup(PA)`). If so, **abort**.
             * **Install:** If verified, move the compiled code to its final location, update the TCG hash map, and update the reverse-map.
             * Releases `tcg_cache_lock`.
+
+### V. CPU Thread Execution Flow & Branch Handling
+
+This section details the interpreter's operational model, control flow handling, and critical edge cases.
+
+#### A. Interpreter Execution Model
+
+1.  **Instruction-by-Instruction Interpretation:**
+    * When a BB cache miss occurs, the interpreter enters **interpretation mode** for that BB.
+    * It decodes and executes instructions **one at a time**, starting from the current `PA`.
+    * After each instruction execution, `rv.PC` is updated to point to the next instruction's VA.
+    * The BB terminates when:
+        * A control-flow instruction is executed (branch, jump, `ecall`, `mret`, etc.).
+        * An exception occurs (illegal instruction, misaligned access, page fault).
+        * The instruction sequence crosses to a new physical page (requires new MMU translation and permission check).
+2.  **BB Boundary Detection:**
+    * After executing each instruction, check if:
+        * The next `PA` would cross a physical page boundary (compare `PFN(current_PA)` with `PFN(next_PA)`).
+        * A control-flow change occurred.
+    * If either condition is true, **terminate the current BB** and return to the main interpreter loop (which will perform MMU translation, permission checks, and cache lookup for the next BB).
+
+#### B. Control Flow Handling
+
+**1. Direct/Static Branches (beq, bne, blt, etc.):**
+
+* **Interpreted Execution:**
+    * Evaluate the branch condition.
+    * Update `rv.PC` to either the branch target (if taken) or `PC + 4` or `PC + 2`.
+    * Terminate the BB and return control to the interpreter loop.
+* **JIT Compilation:**
+    * The JIT must generate code for **both paths** (taken and not-taken).
+    * For tight loops (e.g., `loop: ... beq x1, x2, loop`), special handling is required:
+        * **Backward branches within the same page:** The JIT can emit an internal loop in host code. However, it **must** inject a safepoint check (call to `helper_check_interrupts`) inside the loop to prevent infinite loops from blocking interrupts.
+        * **Example:** For `while(1);` or similar infinite loops, the JIT-compiled code must call `helper_check_interrupts` periodically (e.g., every iteration or every N iterations). This helper checks for pending interrupts and returns to the interpreter if any are found.
+    * **Branch chaining optimization:** If the branch target is already compiled (exists in TCG) and **is in the same page**, the JIT can emit a direct jump to the translated target. Otherwise, it returns the target PA to the interpreter.
+    * **Cross-page branches:** Always terminate the BB and return the target PA to the interpreter (which will perform permission checks and cache lookup).
+
+**2. Indirect/Dynamic Jumps (jalr, ret):**
+
+* **Interpreted Execution:**
+    * Compute the target address from the register value.
+    * Update `rv.PC` to the computed target VA.
+    * Terminate the BB and return to the interpreter loop.
+* **JIT Compilation:**
+    * The target cannot be determined at compile time.
+    * JIT code must:
+        1.  Compute the target VA (read from register, add offset).
+        2.  **Return the target VA to the interpreter** (cannot chain directly).
+        3.  The interpreter will perform MMU translation, permission check, and TCG lookup for the new target.
+
+#### C. Self-Modifying Code (SMC) Edge Cases
+
+**1. Same-Page Self-Modification:**
+
+* **Problem:** A BB writes to memory on the same physical page it's executing from (e.g., unpacking/decryption code, JIT compilers in the guest).
+* **Detection:**
+    * Maintain a per-page **execution state** flag in the `page_versions` array or a separate `page_state` array:
+        * `STATE_NORMAL`: Normal execution (JIT-eligible).
+        * `STATE_SMC_DETECTED`: SMC detected on this page; must interpret only.
+    * When a store instruction writes to a page with `PFN(store_PA) == PFN(current_PC_PA)`:
+        * Set `page_state[PFN] = STATE_SMC_DETECTED`.
+        * Invalidate all JIT cache entries for this PFN (as in II.4).
+        * Set all hotness counters for this page to 0.
+* **Interpreter Behavior:**
+    * In the main loop, after MMU translation, check `page_state[PFN(PA)]`.
+    * If `STATE_SMC_DETECTED`, **force interpretation** (skip TCG lookup, do not accumulate hotness, do not submit for compilation).
+    * Continue interpreting instruction-by-instruction.
+* **State Reset:**
+    * Reset `page_state[PFN]` to `STATE_NORMAL` when:
+        * Execution leaves the page (detected when the next instruction's PFN differs).
+    * This allows JIT compilation to resume once the SMC region is no longer being executed.
+
+**2. Compilation Cancellation on Concurrent Write:**
+
+* **Problem:** The CPU thread writes to a page while the JIT thread is compiling a BB from that page.
+* **Solution:**
+    * The JIT thread registers the PFNs it's compiling in `active_compilations`.
+    * The CPU thread's SMC handler (II.4) checks `active_compilations` before invalidating:
+        * If the PFN is active, set a cancellation flag for that task and **skip the write to `page_versions`** temporarily (or use a separate `pending_invalidation` flag).
+        * The JIT thread checks its cancellation flag periodically (or at commit time) and aborts if set.
+        * After abort, the JIT thread clears its entry from `active_compilations`.
+        * The CPU thread can then proceed with invalidation on its next SMC event (or via a deferred invalidation queue).
+
+#### D. Hotness Counter Management
+
+1.  **Counter Increment:** Increment `hotness[PA]` only when interpreting (cache miss). Do not increment on JIT cache hits.
+2.  **Counter Reset on Invalidation:** When invalidating JIT blocks for a PFN (due to SMC), reset `hotness[PA]` to 0 for all PAs in that PFN. This prevents stale hot blocks from being immediately recompiled if the code has changed.
+3.  **Threshold Tuning:** The threshold (e.g., 64) should be tuned based on profiling. Too low: wastes compilation time on cold code. Too high: misses optimization opportunities.
+
+#### E. JIT Code Generation for Branches
+
+1.  **Forward Branches (within BB):**
+    * Generate conditional host code that mirrors the guest branch logic.
+    * Both paths continue execution within the JIT-compiled block (if they remain in the same BB).
+2.  **Backward Branches (loops):**
+    * Emit a host-level loop for same-page backward branches.
+    * **Critical:** Inject `call helper_check_interrupts` at the loop header or every N iterations.
+    * If the helper detects a pending interrupt, it must:
+        * Update `rv.PC` to the current instruction's VA.
+        * Return to the interpreter (by returning a special sentinel value or setting a flag).
+3.  **Block Chaining:**
+    * For direct branches to already-compiled targets:
+        * Look up the target PA in the TCG.
+        * If found, emit a direct `jmp` to the host code.
+        * If not found, return the target PA to the interpreter.
+    * For indirect jumps (`jalr`), always return to the interpreter.
+4.  **Exit Points:**
+    * Every JIT block must have well-defined exit points:
+        * **Return PA:** The next guest PA to execute (used by the interpreter).
+        * **Exception flag:** Indicate if an exception occurred (page fault, illegal instruction, etc.).
